@@ -3,8 +3,8 @@ import express from 'express';
 import session from 'express-session';
 import cors from 'cors';
 import path from 'path';
-import crypto from 'crypto';
 import bcrypt from 'bcryptjs';
+import jwt from 'jsonwebtoken';
 import { fileURLToPath } from 'url';
 import { connectDB, isDbConnected, User } from './db.js';
 
@@ -40,6 +40,26 @@ function requireDb(req, res, next) {
         });
     }
     next();
+}
+
+// JWTs are signed with the same secret used for session cookies, so only one
+// secret needs to be configured. Logged-in requests send the token back as
+// "Authorization: Bearer <token>".
+const JWT_SECRET = process.env.SESSION_SECRET || 'fallback-secret-key';
+
+function requireAuth(req, res, next) {
+    const header = req.headers.authorization || '';
+    const token = header.startsWith('Bearer ') ? header.slice(7) : null;
+    if (!token) {
+        return res.status(401).json({ message: 'Missing or invalid Authorization header.' });
+    }
+
+    try {
+        req.auth = jwt.verify(token, JWT_SECRET); // { email, iat, exp }
+        next();
+    } catch (err) {
+        return res.status(401).json({ message: 'Invalid or expired token. Please log in again.' });
+    }
 }
 
 // Mail sender: Brevo transactional email REST API (free plan: 300 emails/day).
@@ -186,11 +206,31 @@ app.post('/api/login', requireDb, async (req, res) => {
             }
         }
 
-        const token = crypto.randomBytes(24).toString('hex');
+        const token = jwt.sign({ email: user.email }, JWT_SECRET, { expiresIn: '7d' });
         res.json({ token, user: { fullName: user.fullName, email: user.email } });
     } catch (err) {
         console.error('[login] error:', err.message);
         res.status(500).json({ message: 'Login failed.' });
+    }
+});
+
+// Returns the logged-in user's own account info. Requires a valid JWT from
+// /api/login in the Authorization header — never returns the password hash.
+app.get('/api/me', requireAuth, requireDb, async (req, res) => {
+    try {
+        const user = await User.findOne({ email: req.auth.email });
+        if (!user) {
+            return res.status(404).json({ message: 'Account not found.' });
+        }
+        res.json({
+            fullName: user.fullName,
+            email: user.email,
+            verified: user.verified,
+            createdAt: user.createdAt,
+        });
+    } catch (err) {
+        console.error('[me] error:', err.message);
+        res.status(500).json({ message: 'Could not fetch account info.' });
     }
 });
 
