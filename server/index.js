@@ -117,20 +117,40 @@ app.post('/api/register', requireDb, async (req, res) => {
         return res.status(400).json({ message: 'All fields are required.' });
     }
 
+    const key = email.toLowerCase();
+    let createdUser;
+
+    // Step 1: save the account. Any failure here (duplicate email, bad data,
+    // a DB hiccup) is a genuine "could not create the account" error.
     try {
-        const existing = await User.findOne({ email: email.toLowerCase() });
+        const existing = await User.findOne({ email: key });
         if (existing) {
             return res.status(409).json({ message: 'An account with this email already exists.' });
         }
 
         const passwordHash = await bcrypt.hash(password, 10);
-        await User.create({ fullName, email: email.toLowerCase(), passwordHash, verified: false });
+        createdUser = await User.create({ fullName, email: key, passwordHash, verified: false });
+    } catch (err) {
+        console.error('[register] could not save account:', err.message);
+        return res.status(500).json({ message: 'Could not create the account.' });
+    }
 
+    // Step 2: send the verification email. If THIS fails (e.g. the Brevo
+    // sender isn't verified, bad API key, Brevo is down), the account was
+    // still created — so we roll it back instead of leaving an orphaned,
+    // unverified account that would block every future registration attempt
+    // with "already exists" while never being able to receive its OTP.
+    try {
         const result = await issueOtp(req, email, 'verify');
         res.json({ message: result.message || `We sent a verification code to ${email}.` });
     } catch (err) {
-        console.error('[register] error:', err.message);
-        res.status(500).json({ message: 'Could not create the account.' });
+        console.error('[register] account created but OTP email failed, rolling back:', err.message);
+        await User.deleteOne({ _id: createdUser._id }).catch((cleanupErr) => {
+            console.error('[register] rollback delete failed:', cleanupErr.message);
+        });
+        res.status(502).json({
+            message: 'We could not send the verification email. Please check the mail configuration and try again.',
+        });
     }
 });
 
@@ -153,10 +173,17 @@ app.post('/api/login', requireDb, async (req, res) => {
         }
 
         if (!user.verified) {
-            const result = await issueOtp(req, email, 'verify');
-            return res.json({
-                message: result.message || 'Please verify your email before signing in. We sent a new code.',
-            });
+            try {
+                const result = await issueOtp(req, email, 'verify');
+                return res.json({
+                    message: result.message || 'Please verify your email before signing in. We sent a new code.',
+                });
+            } catch (otpErr) {
+                console.error('[login] credentials ok but OTP email failed:', otpErr.message);
+                return res.status(502).json({
+                    message: 'Your password is correct, but your account is still unverified and we could not send a new code. Please try again shortly.',
+                });
+            }
         }
 
         const token = crypto.randomBytes(24).toString('hex');
