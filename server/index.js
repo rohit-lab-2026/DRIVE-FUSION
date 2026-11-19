@@ -62,6 +62,22 @@ function requireAuth(req, res, next) {
     }
 }
 
+// Guards admin-only routes (e.g. listing every user). Requires a secret
+// header matching ADMIN_KEY on the server - set it in Render's Environment
+// tab, never commit the real value. If ADMIN_KEY isn't configured at all,
+// the route is locked out entirely rather than silently left open.
+function requireAdmin(req, res, next) {
+    const configuredKey = process.env.ADMIN_KEY;
+    if (!configuredKey) {
+        return res.status(503).json({ message: 'Admin access is not configured on this server.' });
+    }
+    const providedKey = req.headers['x-admin-key'];
+    if (providedKey !== configuredKey) {
+        return res.status(403).json({ message: 'Invalid admin key.' });
+    }
+    next();
+}
+
 // Mail sender: Brevo transactional email REST API (free plan: 300 emails/day).
 // It uses HTTPS (port 443), so it works on Render's free tier, which blocks SMTP ports.
 const BREVO_API_KEY = process.env.BREVO_API_KEY;
@@ -231,6 +247,18 @@ app.get('/api/me', requireAuth, requireDb, async (req, res) => {
     } catch (err) {
         console.error('[me] error:', err.message);
         res.status(500).json({ message: 'Could not fetch account info.' });
+    }
+});
+
+// Admin-only: list every registered account. Never returns password hashes.
+// Requires the x-admin-key header to match ADMIN_KEY (see requireAdmin above).
+app.get('/api/users', requireAdmin, requireDb, async (req, res) => {
+    try {
+        const users = await User.find({}, { passwordHash: 0 }).sort({ createdAt: -1 }).lean();
+        res.json(users);
+    } catch (err) {
+        console.error('[users] error:', err.message);
+        res.status(500).json({ message: 'Could not fetch users.' });
     }
 });
 
